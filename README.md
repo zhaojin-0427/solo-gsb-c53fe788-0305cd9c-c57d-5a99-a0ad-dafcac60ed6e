@@ -42,6 +42,14 @@
 > 构成**块对角 LP**——等价于对各分量分别求解 LP 的合取，且行宽一致，不会把
 > 宽度不同的行堆进同一个数组（旧实现会抛
 > `ValueError: ... inhomogeneous shape` 导致接口 500）。
+>
+> **淘汰原因的完整子图复核。** 报告每条未选接缝的原因时，服务把该候选与
+> **它影响的完整已选子图**（其两端点所在已选连通分量的全部已选边；桥接
+> 两个已选簇时两侧都纳入）在同一组全局位姿下重新拟合，再按**实际失败项**
+> 裁定原因：增广集合不可行时给出真实的残差/闭环/重叠超限（诊断值与原因
+> 一致），可行时才报 `score_optimization_not_selected`。只取候选两端的一跳
+> 已选边会把已选路径 A-B-C-D 截断、漏掉 B-C，使本应因闭环超限淘汰的候选
+> A-D 被误报为分数未选——本服务不会这样做（见第 4 节的闭环候选示例）。
 
 ---
 
@@ -203,6 +211,20 @@ curl -s -X POST http://localhost:8000/assemblies \
 `overlap_pixels`（不适用时为 `null`）。淘汰接缝只出现在报告里，
 **不会出现在任何簇的渲染图中**。
 
+> **淘汰原因如何复核（与最优集同一套全局判据）。** 每条未入选候选缝
+> 都与**它实际影响的完整已选子图**一起重估：即已选接缝图中与候选两
+> 端点相连通的**全部**已选边（候选连接两个已选簇时两侧都纳入），加
+> 上候选本身，在同一组全局位姿下重新拟合。只取候选两端的一跳已选边
+> 会把已选路径 A-B-C-D 截成两段、丢掉 B-C，使本应闭环超限的候选
+> A-D 被误报为 `score_optimization_not_selected`——本服务不会这样做。
+> 增广集合不可行时，按**实际超限的约束项**裁定原因：候选自身超限就报
+> 候选自身的实测值；若增广拟合把某条原已选边推超其上限而候选本身未
+> 超限，则按该已选边实际失败的项（点对残差 / 闭环 / 掩膜重叠）给出原
+> 因，并回填该失败项的实测诊断值——不会笼统误报掩膜重叠，诊断值与
+> 原因始终一致。只有增广集合确实可行时才报
+> `score_optimization_not_selected`。复核只读取候选连通的已选子图，
+> 不相关簇的位姿与淘汰归属不受影响。
+
 ### 多簇子集搜索示例（闭环簇 + 独立接缝）
 
 这是修复前会让 `POST /assemblies` 返回 500 的场景：候选接缝图整体连通
@@ -272,6 +294,76 @@ Base64，下方截断展示）。搜索舍弃重叠超限的高分弦 `bc`（9 �
 单簇闭环、纯生成树（无闭环）与完全孤立的片段仍走各自的正常路径
 （树只校掩膜重叠、孤立片段各自成簇）。
 
+### 闭环候选的淘汰归因示例（A-B-C-D 路径 + A-D 候选）
+
+这是淘汰原因曾被误报的场景：最优已选集是路径 **A-B-C-D**（接缝
+`ab`、`bc`、`cd`），未选候选 `ad` 的点对自身拟合残差为 0（通过成对
+预筛），但它隐含的 A→D 相对位姿 `(39, 12)` 与链式推导的 `(117, 0)`
+矛盾约 79 px——与已选路径构成**位姿不自洽的闭环**。旧实现只取候选
+两端的一跳已选边（`ab`、`cd`）重拟合，漏掉 `bc`，增广图退化成可精确
+拟合的树，于是把 `ad` 误报为 `score_optimization_not_selected`。修复后
+服务划定候选影响的**完整已选子图**（`ab+bc+cd` 与 `ad` 一起在同一组
+全局位姿下重拟合），闭环不可行，按实际超限项给出诚实原因。脚本生成
+真实请求（4 张 40×40 透明 PNG、4 条接缝）并调用服务：
+
+```bash
+python examples/make_loop_rejection_example.py --call
+curl -s -X POST http://localhost:8000/assemblies \
+  -H 'Content-Type: application/json' \
+  --data @examples/loop_request.json | python -m json.tool
+```
+
+实际响应（`examples/loop_response.json`；PNG 为真实 Base64，截断展示）。
+最优集保留路径 `ab+bc+cd`（总分 **24**），`ad` 以
+`pose_residual_exceeds_limit` 淘汰，诊断值（16.21 px > 3.0 上限）与
+原因一致：
+
+```json
+{
+  "clusters": [
+    {
+      "cluster_id": 1,
+      "fragment_ids": ["A", "B", "C", "D"],
+      "poses": [
+        {"fragment_id": "A", "theta": 0.0, "tx": 0.0,   "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "B", "theta": 0.0, "tx": 39.0,  "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "C", "theta": 0.0, "tx": 78.0,  "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "D", "theta": 0.0, "tx": 117.0, "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0}
+      ],
+      "adopted_seams": [
+        {"id": "ab", "fragment_a": "A", "fragment_b": "B", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "bc", "fragment_a": "B", "fragment_b": "C", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "cd", "fragment_a": "C", "fragment_b": "D", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40}
+      ],
+      "rejected_seams": [
+        {"id": "ad", "fragment_a": "A", "fragment_b": "D", "score": 5.0,
+         "reason": "pose_residual_exceeds_limit",
+         "pair_residual_max": 16.2146, "loop_error": 16.2146,
+         "overlap_pixels": 1046}
+      ],
+      "total_score": 24.0,
+      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAKwAAAA3CAYAAACRkKFY...（透明 PNG）"
+    }
+  ],
+  "adopted_seam_ids": ["ab", "bc", "cd"],
+  "rejected_seams": [
+    {"id": "ad", "reason": "pose_residual_exceeds_limit", "...": "..."}
+  ],
+  "total_score": 24.0
+}
+```
+
+候选桥接两个已选簇时，两侧连通分量的全部已选边都纳入复核（不相关簇
+的位姿与淘汰归属保持不变）；增广集合不可行时一律按实际失败项裁定，
+绝不报 `score_optimization_not_selected`。
+
 ---
 
 ## 5. 模块结构
@@ -286,7 +378,7 @@ app/
   service.py     端到端编排：成簇、采用/淘汰归因、渲染与响应
   schemas.py     Pydantic 请求/响应模型
   main.py        FastAPI 应用（/health、/assemblies，422 处理）
-examples/        真实请求/响应生成脚本与产物（含多簇闭环场景）
+examples/        真实请求/响应生成脚本与产物（含多簇闭环与闭环候选淘汰归因场景）
 tests/           API、几何、全局优化器（含对拍暴力枚举）与多片段闭环测试
 ```
 

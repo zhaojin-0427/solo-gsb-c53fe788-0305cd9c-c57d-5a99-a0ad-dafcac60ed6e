@@ -9,3 +9,6 @@ examples/cluster_*.png
 examples/multi_request.json
 examples/multi_response.json
 examples/multi_cluster_*.png
+examples/loop_request.json
+examples/loop_response.json
+examples/loop_cluster_*.png

@@ -33,12 +33,82 @@ def _rejection_record(edge: Edge, reason: str, m: EdgeMetrics = None):
     return rec
 
 
-def _failure_reason(edge: Edge, m: EdgeMetrics) -> str:
+def _violations(edge: Edge, m: EdgeMetrics) -> List[str]:
+    """Constraint violations of one edge under the joint fit.
+
+    Returned in the canonical reason-priority order: point-pair residual,
+    then loop closure, then solid-mask overlap.
+    """
+    out: List[str] = []
     if m.pair_max > edge.pose_limit + 1e-9:
-        return "pose_residual_exceeds_limit"
+        out.append("pose_residual_exceeds_limit")
     if m.loop_error > edge.pose_limit + 1e-9:
-        return "loop_closure_exceeds_limit"
-    return "mask_overlap_exceeds_limit"
+        out.append("loop_closure_exceeds_limit")
+    if m.overlap > edge.overlap_limit:
+        out.append("mask_overlap_exceeds_limit")
+    return out
+
+
+def _affected_selected_subgraph(chosen: List[Edge], seed_nodes) -> List[Edge]:
+    """Every selected edge in the component(s) of the selected-seam graph
+    touched by ``seed_nodes`` (the candidate's two endpoints).
+
+    A rejected candidate must be re-judged against the *complete* selected
+    subgraph it would augment.  Taking only the one-hop selected edges at
+    its endpoints drops the middle of a selected path (A-B-C-D loses B-C),
+    turning a pose-inconsistent closed loop into an exactly-fittable tree
+    and hiding the real rejection cause.  A candidate may also bridge two
+    previously separate clusters; both sides' constraints must be
+    re-checked, while unrelated clusters are left out entirely.
+    """
+    adj: Dict[str, List[Edge]] = {}
+    for x in chosen:
+        adj.setdefault(x.a, []).append(x)
+        adj.setdefault(x.b, []).append(x)
+    seen_nodes = set()
+    seen_ids = set()
+    out: List[Edge] = []
+    stack = [n for n in seed_nodes if n in adj]
+    while stack:
+        cur = stack.pop()
+        if cur in seen_nodes:
+            continue
+        seen_nodes.add(cur)
+        for x in adj.get(cur, ()):
+            if x.id not in seen_ids:
+                seen_ids.add(x.id)
+                out.append(x)
+            nxt = x.b if x.a == cur else x.a
+            if nxt not in seen_nodes:
+                stack.append(nxt)
+    return out
+
+
+def _augmented_failure(trial: List[Edge], cand: Edge,
+                       metrics: Dict[str, EdgeMetrics]):
+    """Adjudicate why ``selected subgraph + candidate`` is infeasible.
+
+    Returns ``(reason, diagnostics)``.  The candidate's own violations
+    take priority.  Otherwise the augmented fit pushed an originally
+    selected edge over its limit while the candidate itself is within
+    limits: the reason is then taken from the edge that *actually* fails
+    (never a blanket mask-overlap claim), and the reported diagnostics are
+    that edge's measured values, so the numbers always corroborate the
+    stated reason.
+    """
+    m_cand = metrics[cand.id]
+    own = _violations(cand, m_cand)
+    if own:
+        return own[0], m_cand
+    for x in sorted(trial, key=lambda e: e.id):
+        if x.id == cand.id:
+            continue
+        v = _violations(x, metrics[x.id])
+        if v:
+            return v[0], metrics[x.id]
+    # evaluate_subset only reports infeasible when some edge violates, so
+    # this is unreachable; stay honest if it ever happens.
+    return "pose_residual_exceeds_limit", m_cand
 
 
 def assemble(payload) -> dict:
@@ -98,20 +168,23 @@ def assemble(payload) -> dict:
             rec["loop_error"] = 0.0
             rec["overlap_pixels"] = None
         else:
-            # Test this seam honestly together with all accepted seams,
-            # under the joint global poses of the augmented graph.  Include
-            # every accepted edge incident on either endpoint (a candidate
-            # may bridge two previously separate clusters).
-            involved = {e.a, e.b}
-            trial = [x for x in chosen
-                     if x.a in involved or x.b in involved] + [e]
+            # Test this seam honestly against the *complete* selected
+            # subgraph it would augment: every selected edge in the
+            # connected component(s) touching its endpoints, re-fitted
+            # jointly with the candidate under one set of global poses.
+            # (One-hop edges alone would drop the middle of a selected
+            # path and hide the closed loop that forbids the candidate;
+            # a candidate bridging two clusters re-checks both sides.)
+            trial = _affected_selected_subgraph(chosen, (e.a, e.b)) + [e]
             ok_aug, m_aug, _, _ = evaluate_subset(trial, masks, overlap_cache)
             if ok_aug:
-                reason = "score_optimization_not_selected"
-                rec = _rejection_record(e, reason, m_aug[e.id])
+                # The augmented set is feasible under one global pose set,
+                # so the exact search left this seam out purely for score.
+                rec = _rejection_record(e, "score_optimization_not_selected",
+                                        m_aug[e.id])
             else:
-                reason = _failure_reason(e, m_aug[e.id])
-                rec = _rejection_record(e, reason, m_aug[e.id])
+                reason, diag = _augmented_failure(trial, e, m_aug)
+                rec = _rejection_record(e, reason, diag)
         ra = find(e.a)
         rejected_by_cluster.setdefault(ra, []).append(rec)
         rejected_flat.append(rec)
