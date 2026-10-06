@@ -197,11 +197,101 @@ curl -s -X POST http://localhost:8000/assemblies \
 | `pose_residual_exceeds_limit` | 与已采用接缝放在同一组全局位姿后，点对残差超上限 |
 | `loop_closure_exceeds_limit` | 闭环误差（相对位姿不自洽）超上限 |
 | `mask_overlap_exceeds_limit` | 该相对位姿下实体掩膜重叠像素数超上限 |
-| `score_optimization_not_selected` | 本身可行，但为使总分最大而未被精确搜索选中 |
+| `score_optimization_not_selected` | 与全部已采用接缝联合拟合后**仍然可行**，但为使总分最大而未被精确搜索选中 |
 
 淘汰记录同时回填测得的 `pair_residual_max` / `loop_error` /
 `overlap_pixels`（不适用时为 `null`）。淘汰接缝只出现在报告里，
 **不会出现在任何簇的渲染图中**。
+
+#### 淘汰原因是怎么复核出来的
+
+每条未选接缝（自身点对拟合合格的）都会与已采用接缝做一次**联合增广
+拟合**，并按这次拟合的实测结果裁定原因：
+
+1. **划定候选影响的完整已选子图。** 从候选两个端点出发，沿已采用接缝
+   做连通扩展——候选触及的**整个**已选连通分量都要纳入复核，而不是只取
+   与候选两端一跳相邻的已选边。候选若连接两个此前分开的已选簇，则
+   **两侧约束同时纳入**；其它无关簇的位姿与淘汰归属保持不变。
+2. 在这一个增广集合上重算统一全局位姿与全部指标。
+   - 若增广集合**可行**，才报 `score_optimization_not_selected`
+     （正分数 + 精确搜索下，最优集的任何可行增广都会被选中，因此正常
+     输入里该码只在理论上出现）；
+   - 若**不可行，则绝不报“分数优化未选”**，而是按**实际超限的约束项**
+     在「点对残差 → 闭环误差 → 掩膜重叠」的顺序下裁定。这里的“实际超限”
+     包括候选把全局位姿拉偏后、**原有已选接缝**超出其自身（可能更紧的）
+     上限的情况：即使候选自身的三项指标都没超，也按真正失败的那条接缝
+     报告位姿/闭环原因，不会落到“掩膜重叠”上。
+3. **诊断值与原因一致。** 记录回填的是上述增广拟合中实测的值；原因对应
+   维度的数值取自该维度真正超限的接缝中的最差值（必超其上限），其余维度
+   取候选自身实测值。因此 `pose_residual_exceeds_limit` 一定伴随
+   `pair_residual_max > pose_error_limit`，`mask_overlap_exceeds_limit`
+   时残差/闭环必在上限内，不存在原因与数值互相矛盾的报告。
+
+### 路径 + 矛盾弦示例（淘汰原因复核修复）
+
+这是修复前会把淘汰原因报错的场景：已选接缝形成路径
+`A-B-C-D`（各 8 分），未选弦 `ad`（7 分）与路径构成
+`A-B-C-D-A` 闭环，且其点对带有 20px 的闭环矛盾，任何统一全局位姿都无法
+在 3px 上限内同时满足四条接缝。修复前复核只取候选两端一跳的已选边
+（`ab`、`cd`），漏掉路径中段的 `bc`——增广集合退化成一棵
+`ab-ad-cd` 树，树位姿下每条边残差恒为 0，于是矛盾弦被误报为
+`score_optimization_not_selected`。修复后复核纳入完整路径，如实报告
+`pose_residual_exceeds_limit`：
+
+```bash
+python examples/make_loop_example.py --call
+curl -s -X POST http://localhost:8000/assemblies \
+  -H 'Content-Type: application/json' \
+  --data @examples/loop_request.json | python -m json.tool
+```
+
+实际响应（`examples/loop_response.json`，4 张 40×40 透明 PNG，
+Base64 已截断）：
+
+```json
+{
+  "clusters": [
+    {
+      "cluster_id": 1,
+      "fragment_ids": ["A", "B", "C", "D"],
+      "poses": [
+        {"fragment_id": "A", "theta": 0.0, "tx": 0.0,   "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "B", "theta": 0.0, "tx": 39.0,  "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "C", "theta": 0.0, "tx": 78.0,  "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0},
+        {"fragment_id": "D", "theta": 0.0, "tx": 117.0, "ty": 0.0,
+         "pair_residual_rms": 0.0, "pair_residual_max": 0.0}
+      ],
+      "adopted_seams": [
+        {"id": "ab", "fragment_a": "A", "fragment_b": "B", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "bc", "fragment_a": "B", "fragment_b": "C", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40},
+        {"id": "cd", "fragment_a": "C", "fragment_b": "D", "score": 8.0,
+         "pair_residual_max": 0.0, "loop_error": 0.0, "overlap_pixels": 40}
+      ],
+      "rejected_seams": [
+        {"id": "ad", "fragment_a": "A", "fragment_b": "D", "score": 7.0,
+         "reason": "pose_residual_exceeds_limit",
+         "pair_residual_max": 28.8903, "loop_error": 28.8903,
+         "overlap_pixels": 0}
+      ],
+      "total_score": 24.0,
+      "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAKwAAAA3CAYAAACRkKFY...（透明 PNG）"
+    }
+  ],
+  "adopted_seam_ids": ["ab", "bc", "cd"],
+  "rejected_seams": [
+    {"id": "ad", "reason": "pose_residual_exceeds_limit", "...": "..."}
+  ],
+  "total_score": 24.0
+}
+```
+
+`--call` 同时写出簇渲染图 `examples/loop_cluster.png`；弦 `ad` 不参与
+渲染。
 
 ### 多簇子集搜索示例（闭环簇 + 独立接缝）
 
@@ -286,8 +376,8 @@ app/
   service.py     端到端编排：成簇、采用/淘汰归因、渲染与响应
   schemas.py     Pydantic 请求/响应模型
   main.py        FastAPI 应用（/health、/assemblies，422 处理）
-examples/        真实请求/响应生成脚本与产物（含多簇闭环场景）
-tests/           API、几何、全局优化器（含对拍暴力枚举）与多片段闭环测试
+examples/        真实请求/响应生成脚本与产物（含多簇闭环、路径+矛盾弦场景）
+tests/           API、几何、全局优化器（含对拍暴力枚举）、多片段闭环与淘汰归因测试
 ```
 
 ### 位姿约定

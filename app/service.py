@@ -1,4 +1,12 @@
-"""End-to-end assembly orchestration: builds the response payload."""
+"""End-to-end assembly orchestration: builds the response payload.
+
+Rejected seams are re-checked against the accepted set by fitting the
+**complete** selected subgraph the candidate reaches (both sides when it
+bridges two chosen clusters), not just its one-hop incident edges.  The
+rejection reason follows whatever constraint actually fails under that
+augmented joint fit; a feasible augmentation is the only case reported as
+``score_optimization_not_selected``.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +15,7 @@ from typing import Dict, List
 import numpy as np
 
 from .assembler import (
+    EPS,
     Edge,
     EdgeMetrics,
     build_model,
@@ -33,12 +42,81 @@ def _rejection_record(edge: Edge, reason: str, m: EdgeMetrics = None):
     return rec
 
 
-def _failure_reason(edge: Edge, m: EdgeMetrics) -> str:
-    if m.pair_max > edge.pose_limit + 1e-9:
-        return "pose_residual_exceeds_limit"
-    if m.loop_error > edge.pose_limit + 1e-9:
-        return "loop_closure_exceeds_limit"
-    return "mask_overlap_exceeds_limit"
+def _affected_subset(candidate: Edge, chosen: List[Edge]):
+    """Complete selected subgraph reached by the candidate's endpoints.
+
+    When re-checking a rejected candidate against the accepted seams, the
+    trial must contain **every** accepted edge in the chosen connected
+    component(s) the candidate touches -- not merely the edges one hop from
+    its endpoints.  If the selected seams form the path A-B-C-D and the
+    candidate is the chord A-D, closing the loop only exists once B-C is
+    present; dropping it turns the augmented graph into a tree that fits
+    exactly and hides the real residual / loop-closure failure.  A
+    candidate may also bridge two previously separate chosen clusters, in
+    which case both components are pulled in and checked jointly.
+    """
+    nodes = {n for e in chosen for n in (e.a, e.b)}
+    adj: Dict[str, set] = {n: set() for n in nodes}
+    for e in chosen:
+        adj[e.a].add(e.b)
+        adj[e.b].add(e.a)
+
+    reached: set = set()
+    stack = [candidate.a, candidate.b]
+    while stack:
+        cur = stack.pop()
+        if cur in reached or cur not in adj:
+            continue
+        reached.add(cur)
+        stack.extend(adj[cur] - reached)
+
+    return [e for e in chosen if e.a in reached] + [candidate]
+
+
+def _augmented_failure(candidate: Edge, trial: List[Edge],
+                       metrics: Dict[str, EdgeMetrics]) -> tuple:
+    """Classify why the augmented set is infeasible and build its record.
+
+    The verdict follows the edges that actually fail under the joint
+    global poses -- including previously accepted seams whose tighter
+    per-seam limits are broken once the candidate forces a compromise --
+    rather than the candidate alone.  Priority (residual, loop closure,
+    mask overlap) matches the feasibility test order.  Each reported
+    diagnostic is the worst measured value of that quantity over the
+    edges genuinely violating the corresponding kind of limit, so the
+    numbers are consistent with the reason and exceed the offending
+    edge's limit; non-violating quantities fall back to the candidate's
+    own measured value.
+    """
+    pair_offenders = [x for x in trial
+                      if metrics[x.id].pair_max > x.pose_limit + EPS]
+    loop_offenders = [x for x in trial
+                      if metrics[x.id].loop_error > x.pose_limit + EPS]
+    overlap_offenders = [x for x in trial
+                         if metrics[x.id].overlap > x.overlap_limit]
+
+    if pair_offenders:
+        reason = "pose_residual_exceeds_limit"
+    elif loop_offenders:
+        reason = "loop_closure_exceeds_limit"
+    else:
+        reason = "mask_overlap_exceeds_limit"
+
+    me = metrics[candidate.id]
+    if pair_offenders:
+        pair_val = max(metrics[x.id].pair_max for x in pair_offenders)
+    else:
+        pair_val = me.pair_max
+    if loop_offenders:
+        loop_val = max(metrics[x.id].loop_error for x in loop_offenders)
+    else:
+        loop_val = me.loop_error
+    if overlap_offenders:
+        overlap_val = max(metrics[x.id].overlap for x in overlap_offenders)
+    else:
+        overlap_val = me.overlap
+    diag = EdgeMetrics(pair_val, me.pair_rms, loop_val, overlap_val)
+    return reason, diag
 
 
 def assemble(payload) -> dict:
@@ -98,20 +176,22 @@ def assemble(payload) -> dict:
             rec["loop_error"] = 0.0
             rec["overlap_pixels"] = None
         else:
-            # Test this seam honestly together with all accepted seams,
-            # under the joint global poses of the augmented graph.  Include
-            # every accepted edge incident on either endpoint (a candidate
-            # may bridge two previously separate clusters).
-            involved = {e.a, e.b}
-            trial = [x for x in chosen
-                     if x.a in involved or x.b in involved] + [e]
+            # Re-fit this candidate jointly with the *complete* selected
+            # subgraph it touches (full chosen components, both sides when
+            # it bridges two clusters) under one set of global poses.
+            trial = _affected_subset(e, chosen)
             ok_aug, m_aug, _, _ = evaluate_subset(trial, masks, overlap_cache)
             if ok_aug:
+                # The augmented set really is feasible; only then is the
+                # candidate excluded purely for total-score maximisation.
                 reason = "score_optimization_not_selected"
                 rec = _rejection_record(e, reason, m_aug[e.id])
             else:
-                reason = _failure_reason(e, m_aug[e.id])
-                rec = _rejection_record(e, reason, m_aug[e.id])
+                # Infeasible: never blame score optimisation.  Classify by
+                # the constraints that actually fail under the joint fit,
+                # with diagnostics measured on the same fit.
+                reason, diag = _augmented_failure(e, trial, m_aug)
+                rec = _rejection_record(e, reason, diag)
         ra = find(e.a)
         rejected_by_cluster.setdefault(ra, []).append(rec)
         rejected_flat.append(rec)
